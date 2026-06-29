@@ -1,10 +1,8 @@
 # SLM — Small Language Model from Scratch
 
-Built a character-level language model from scratch in PyTorch, progressing from a simple MLP baseline to a GPT-style transformer. Every component implemented manually — no HuggingFace, no `nn.Transformer`, no shortcuts.
+Built a character-level language model from scratch in PyTorch, progressing from a simple MLP baseline to a GPT-style transformer with BPE tokenization. Every component implemented manually — no HuggingFace, no `nn.Transformer`, no shortcuts.
 
-**Dataset:** Tiny Shakespeare (1.1M characters)  
-**Hardware:** NVIDIA RTX 3050 6GB Laptop GPU  
-**Framework:** PyTorch 2.7, CUDA 12.8
+**Dataset:** Tiny Shakespeare (1.1M characters) | **GPU:** RTX 3050 6GB | **Framework:** PyTorch 2.7 + CUDA 12.8
 
 ---
 
@@ -12,196 +10,260 @@ Built a character-level language model from scratch in PyTorch, progressing from
 
 ```
 slm/
-├── data/
-│   └── input.txt                  ← Tiny Shakespeare corpus
+├── data/input.txt                 ← Tiny Shakespeare corpus
 ├── char_lm/                       ← Phase 0: MLP baseline
-│   ├── dataset.py                 ← Tokenizer + Dataset + DataLoader
+│   ├── dataset.py                 ← Character tokenizer + Dataset
 │   ├── model_tanh.py              ← MLP with Tanh activation
 │   ├── model_gelu.py              ← MLP with GELU activation
-│   └── __init__.py
+│   ├── bpe_tokenizer.py           ← BPE tokenizer from scratch
+│   ├── dataset_bpe.py             ← Dataset using BPE tokenizer
+│   └── bpe_1000.json              ← Pre-trained BPE vocab (1000 tokens)
 ├── transformer/                   ← Phase 1: GPT-style transformer
 │   ├── attention.py               ← Single + Multi-head attention
 │   ├── transformer.py             ← TransformerBlock + GPTModel
 │   ├── train.py                   ← GPT-6L-128D training script
-│   ├── train1.py                  ← GPT-8L-256D-AMP training script
-│   └── __init__.py
-└── train.py                       ← MLP training + Tanh vs GELU experiment
+│   ├── train1.py                  ← GPT-8L-256D + AMP training script
+│   └── train_bpe.py               ← GPT-8L-256D + BPE + AMP training
+├── weights/
+│   ├── gpt_8l_256d_amp.pt         ← Char tokenizer model weights
+│   └── gpt_8l_256d_bpe1000_amp.pt ← BPE model weights (best)
+└── train.py                       ← MLP experiment (Tanh vs GELU)
 ```
 
 ---
 
 ## Phase 0 — MLP Baseline
 
-### What Was Built
+**Architecture:** `Embedding → Flatten → Linear → Activation → Linear → Logits`
 
-A character-level MLP language model trained on Shakespeare. Built to understand the training loop, data pipeline, and the fundamental limitations of flat context modeling before building the transformer.
-
-**Architecture:**
-```
-Token IDs → Embedding → Flatten → Linear → Activation → Linear → Logits
-```
-
-**Key insight:** Flattening destroys all positional relationships between tokens. The model sees 32 characters mashed into one vector — it cannot know that token at position 0 relates to token at position 31. This is exactly the limitation attention solves.
+The MLP flattens all token embeddings into one vector before prediction — destroying positional relationships. This is the architectural ceiling the transformer was built to break.
 
 ### Experiment: Tanh vs GELU
 
-Ran a controlled ablation — identical architecture, only activation function changed.
+Controlled ablation — identical architecture, only activation changed:
 
-| Activation | Step 100 Loss | Final Loss | Notes |
+| Activation | Step 100 | Final Loss | Notes |
 |---|---|---|---|
-| Tanh | 2.57 | 0.27 | Collapsed to `&&&&` at larger size |
-| GELU | 1.93 | 0.21 | Stable, consistent convergence |
+| Tanh | 2.57 | 0.27 | Collapsed to `&&&&` at larger scale |
+| GELU | 1.93 | 0.21 | Stable throughout |
 
-**Finding:** At small scale both tied. At larger scale (block_size=32, 1.1M params) Tanh neurons saturated and collapsed — generating repeating garbage characters. GELU maintained stable gradients throughout. This empirically confirmed why every modern transformer uses GELU.
-
-**GELU:** Gaussian Error Linear Unit. Soft probabilistic gate — scales input by the probability it's positive. Unbounded positive side means gradients stay healthy for large activations, unlike Tanh which squashes everything to (-1, 1).
-
-### MLP Final Results
-
-```
-Params:        1,129,056
-Block size:    32
-Val loss:      0.21
-Training time: 19 seconds (GPU)
-Generation:    correct structure, gibberish words
-```
+**Finding:** At larger context (block_size=32, 1.1M params) Tanh neurons saturated and collapsed. GELU's unbounded positive side kept gradients healthy. Proved empirically — not just from reading.
 
 ---
 
 ## Phase 1 — GPT-Style Transformer
 
-### Architecture
+### Components Built from Scratch
 
-Built every component from scratch:
-
-**Single-Head Attention:**
+**Causal Self-Attention:**
 ```
-Q = x @ W_q        (what am I looking for?)
-K = x @ W_k        (what do I contain?)
-V = x @ W_v        (what do I give if selected?)
-
+Q, K, V = x @ W_q,  x @ W_k,  x @ W_v
 scores  = Q @ K.T / sqrt(head_size)
-scores  = masked_fill(future positions → -inf)
-weights = softmax(scores)
-output  = weights @ V
+scores  = masked_fill(future → -inf)
+output  = softmax(scores) @ V
 ```
 
-**Causal Mask:** Lower triangular matrix. Token at position `t` can only attend to positions `0..t`. Future tokens are set to `-inf` before softmax → become exactly `0` after softmax. Prevents the model from "cheating" by looking ahead during training.
-
-**Multi-Head Attention:** Runs `n_heads` attention operations in parallel, each learning different relationship types (syntax, semantics, position). Outputs concatenated and projected back to `d_model`.
+**Multi-Head Attention** — N heads in parallel, each learning different relationship types. Outputs concatenated and projected back to `d_model`.
 
 **Transformer Block:**
 ```python
-x = x + attention(layernorm(x))   # pre-norm residual
-x = x + feedforward(layernorm(x)) # pre-norm residual
+x = x + attention(layernorm(x))    # pre-norm residual
+x = x + feedforward(layernorm(x))  # pre-norm residual
 ```
 
-**Residual connections:** Each block adds a small correction to `x` rather than replacing it. Original information flows through every layer untouched — enables training 8+ layers deep without vanishing gradients.
-
-**LayerNorm:** Normalizes each token vector to mean=0, std=1 before each sub-layer. Keeps activations stable through many layers. Pre-norm (normalize before attention) is more stable than post-norm.
-
-**Feedforward Network:** Two linear layers with 4x expansion. `d_model → 4*d_model → d_model`. Each token processed independently — this is where the model "thinks" after attention decides which tokens to look at.
-
-**Positional Embedding:** Learned position vectors added to token embeddings. Each of the `block_size` positions has its own `d_model`-dimensional vector. Gives the model explicit knowledge of token order — unlike the MLP which destroyed position information.
+**Residual connections** let gradients flow directly to early layers — enables training 8 blocks deep without vanishing gradients.
 
 ### Training Infrastructure
 
-**AdamW:** Adaptive per-weight learning rates (Adam) + correct weight decay (W). Each weight gets its own effective step size based on gradient history. Used by every modern LLM.
-
-**Gradient Clipping:** After `backward()`, before `step()`. If total gradient magnitude exceeds 1.0, scale all gradients down proportionally. Prevents any single bad batch from destroying training.
-
-**Warmup + Cosine LR Schedule:**
-```
-Steps 1 → 500:     linear warmup  (0 → max_lr)
-Steps 500 → 10000: cosine decay   (max_lr → min_lr)
-```
-Warmup prevents early instability when gradients are unreliable. Cosine decay lets the model settle precisely into a minimum at the end.
-
-**Mixed Precision (AMP):** Forward pass in float16, backward in float32, weights in float32. Cuts activation memory ~40%, faster on tensor cores. Gradient scaling prevents float16 underflow — tiny gradients multiplied by large scale factor, then divided back after backward pass.
-
-**Validation Loss:** 10% of data held out — never trained on. Measured every 100 steps by averaging loss over 20 random validation batches. Confirms generalization vs memorization.
-
----
-
-## Experiment Results — Full Progression
-
-| Model | Params | Block Size | Steps | Val Loss | Time | Generation Quality |
-|---|---|---|---|---|---|---|
-| MLP Tanh | 335K | 8 | 5000 | 0.27 | 40s (CPU) | gibberish |
-| MLP GELU | 335K | 8 | 5000 | 0.30 | 38s (CPU) | gibberish |
-| MLP GELU | 1.1M | 32 | 5000 | 0.21 | 19s (GPU) | structure correct, words wrong |
-| Transformer 4L-64D | 209K | 32 | 5000 | 1.65 | 174s | real words, broken grammar |
-| Transformer 6L-128D | 1.2M | 32 | 10000 | 1.37 | 1272s | sentences, multi-speaker |
-| + LR schedule | 1.2M | 32 | 10000 | 1.37 | 406s | same quality, 3x faster |
-| + Block size 128 | 1.2M | 128 | 10000 | 1.32 | 660s | coherent dialogue |
-| + AMP | 1.2M | 128 | 10000 | 1.34 | 555s | same, 16% faster |
-| GPT-8L-256D + AMP | 6.4M | 128 | 10000 | **0.94** | 1928s | iambic pentameter |
-
-**Perplexity at final model:** `exp(0.94) = 2.56` — on average choosing between ~2.56 equally likely next characters.
-
----
-
-## Key Concepts — One-Liner Reference
-
-| Concept | What it is |
+| Technique | What it does |
 |---|---|
-| Tokenization | Converting text to integers via a character→index dictionary |
-| Embedding | Learnable lookup table — each token ID maps to a dense vector |
-| Positional embedding | Learned position vectors added to token embeddings so the model knows token order |
-| Attention | Each token computes how much to attend to every other token via Q·K dot products |
-| Causal mask | Lower triangular matrix preventing tokens from attending to future positions |
-| Scaled dot-product | Divide attention scores by √head_size to prevent softmax saturation |
-| Multi-head attention | Run N attention heads in parallel, each learning different relationship types |
-| Residual connection | `x = x + layer(x)` — preserves original signal, enables deep networks |
-| LayerNorm | Normalize each token vector to mean=0, std=1 — stabilizes activations |
-| Feedforward block | Per-token MLP with 4x expansion — where the model "thinks" after attention |
-| Cross-entropy loss | `-log(probability assigned to correct next token)` — the training signal |
-| AdamW | Adaptive per-weight learning rates + weight decay — standard LLM optimizer |
-| Gradient clipping | Cap total gradient norm at 1.0 — prevents single bad batch destroying training |
-| LR warmup | Ramp learning rate from 0 to max over first N steps — prevents early instability |
-| Cosine decay | Gradually reduce LR following cosine curve — smooth convergence at end |
-| Mixed precision | Forward in float16, backward in float32 — 40% less memory, faster on GPU |
-| Gradient scaling | Multiply loss before backward to prevent float16 underflow of tiny gradients |
-| Validation loss | Loss on held-out data — measures generalization, catches overfitting |
-| Temperature sampling | Divide logits by T before softmax — lower T = more confident, higher = more random |
-| Teacher forcing | During training, feed ground truth context rather than model's own predictions |
-| Perplexity | `exp(val_loss)` — average number of equally likely choices the model sees |
+| AdamW | Adaptive per-weight LR + weight decay — standard LLM optimizer |
+| Gradient clipping | Cap gradient norm at 1.0 — prevents single bad batch destroying training |
+| LR warmup | Ramp LR 0 → max over 500 steps — prevents early instability |
+| Cosine decay | Smoothly reduce LR to min — precise convergence at end |
+| Mixed precision (AMP) | Forward float16, backward float32 — 40% less memory, faster |
+| Gradient scaling | Prevents float16 underflow of tiny gradients |
+| Validation loss | 10% held-out data every 100 steps — catches overfitting |
 
 ---
 
-## Generated Samples — Final Model (GPT-8L-256D)
+## Phase 2 — BPE Tokenizer
 
-**Prompt: `ROMEO:`**
+Built Byte Pair Encoding from scratch — the same algorithm used by GPT-2.
+
+**Algorithm:**
+1. Start with individual characters as base vocabulary (65 tokens)
+2. Count all adjacent token pairs across the full corpus
+3. Merge the most frequent pair into a new token
+4. Repeat until target vocabulary size reached
+
+```
+merge 100: 'e' + '</w>'   → 'e</w>'    ← word endings
+merge 200: 'h' + 'ea'     → 'hea'      ← syllables
+merge 300: 'fu' + 'l</w>' → 'ful</w>'  ← suffixes
+merge 400: 'wa' + 'y</w>' → 'way</w>'  ← complete words
+```
+
+**Result at vocab_size=1000:**
+
+| | Char tokenizer | BPE-1000 |
+|---|---|---|
+| Vocab size | 65 | 1000 |
+| Corpus tokens | 1,115,394 | 494,773 |
+| Compression | 1× | 2.25× |
+| Context coverage | ~20 words per window | ~50 words per window |
+
+```
+Input: "What light through yonder window breaks"
+
+Char (38 tokens): W h a t   l i g h t   t h r o u g h ...
+BPE  (7 tokens):  What  light  through  yonder  window  breaks
+```
+
+---
+
+## Results — Full Progression
+
+| Model | Params | Tokenizer | Block | Steps | Val Loss | Perplexity | Time |
+|---|---|---|---|---|---|---|---|
+| MLP Tanh | 335K | char-65 | 8 | 5000 | 0.27 | 1.31 | 40s CPU |
+| MLP GELU | 1.1M | char-65 | 32 | 5000 | 0.21 | 1.23* | 19s GPU |
+| Transformer 4L-64D | 209K | char-65 | 32 | 5000 | 1.65 | 5.21 | 174s |
+| Transformer 6L-128D | 1.2M | char-65 | 32 | 10000 | 1.37 | 3.94 | 406s |
+| + Block 128 | 1.2M | char-65 | 128 | 10000 | 1.32 | 3.74 | 660s |
+| + AMP | 1.2M | char-65 | 128 | 10000 | 1.34 | 3.82 | 555s |
+| GPT-8L-256D + AMP | 6.4M | char-65 | 128 | 10000 | 0.94 | 2.56 | 1928s |
+| **GPT-8L-256D + BPE + AMP** | **6.9M** | **BPE-1000** | **128** | **10000** | **0.26** | **1.30** | **1762s** |
+
+> *MLP perplexity 1.23 is misleading — it memorized character statistics, not language structure.
+> The BPE transformer at perplexity 1.30 generates coherent multi-play Shakespeare dialogue.
+
+---
+
+## Generated Samples
+
+### Character Tokenizer — GPT-8L-256D (val loss 0.94)
+
+**`ROMEO:`**
 ```
 ROMEO:
 Good night, I might be offenced me.
-Me ready Carthan go to Petruchio!
 Come our hopings to enjoy, upon thy face,
 That sees thus spoke them wounds, that she doth her
 The seal of heavenly stubble that h
 ```
 
-**Prompt: `KING RICHARD:`**
-```
-KING RICHARD:
-Somerset, in sail'd by their lawful king,
-And made by the time to part the lame.
-The noble and take her gone,
-And there recomes a holy commanding tremble,
-To the princes of those woman, this news nev
-```
-
-**Prompt: `First Citizen:`**
+**`First Citizen:`**
 ```
 First Citizen:
-Your partine is some part of my brother;
-But I by this apprehension.
-This gentleman, let me that hath that never doers,
 To sweet sorrow to be tide 'gainst God's majesty!
-
 JULIET:
 It is, my lord.
 ```
+
+### BPE Tokenizer — GPT-8L-256D (val loss 0.26)
+
+**`ROMEO:`**
+```
+ROMEO: LORD ROSS: At fear how quiet, ladicious to From all rance;
+Show we will help you yet, adilia.
+DUKE OF YORK: Which is my sisterhred is loved?
+HENRY BOLINGBROKE: Then, my liege,
+Which way to take her, to make the Timeless play--
+```
+
+**`First Citizen:`**
+```
+First Citizen: in these fire; and we are like to meet your confersul.
+DUKE VINCENTIO: Then is a spotrealing, to acquior of her privilege
+Why feed the devil, where roatten hate and waken
+Barnardine and Romeo comes in Rome!
+```
+
+> BPE model references HENRY BOLINGBROKE, DUKE OF YORK, DUKE VINCENTIO, Barnardine
+> and Romeo — real characters from different Shakespeare plays. The model learned the
+> entire canon as an interconnected world.
+
+---
+
+## Use Pre-trained Weights
+
+Download weights from the `weights/` folder and run inference directly:
+
+```python
+import torch
+import torch.nn.functional as F
+import sys
+sys.path.append('.')
+
+from transformer.transformer import GPTModel
+from char_lm.bpe_tokenizer import BPETokenizer
+
+DEVICE     = "cuda" if torch.cuda.is_available() else "cpu"
+BLOCK_SIZE = 128
+
+# load tokenizer
+tokenizer = BPETokenizer()
+tokenizer.load("char_lm/bpe_1000.json")
+
+# load model
+model = GPTModel(
+    vocab_size = tokenizer.vocab_size,
+    block_size = BLOCK_SIZE,
+    d_model    = 256,
+    n_heads    = 8,
+    n_layers   = 8,
+)
+model.load_state_dict(torch.load("weights/gpt_8l_256d_bpe1000_amp.pt",
+                                  map_location=DEVICE))
+model = model.to(DEVICE)
+model.eval()
+
+# generate
+prompt = "ROMEO:"
+ids    = tokenizer.encode(prompt)
+
+if len(ids) < BLOCK_SIZE:
+    ids = [ids[0]] * (BLOCK_SIZE - len(ids)) + ids
+
+idx = torch.tensor([ids], dtype=torch.long, device=DEVICE)
+
+with torch.no_grad():
+    for _ in range(200):
+        idx_cond = idx[:, -BLOCK_SIZE:]
+        logits, _ = model(idx_cond)
+        logits = logits[:, -1, :] / 0.8
+        probs  = F.softmax(logits, dim=-1)
+        next_id = torch.multinomial(probs, num_samples=1)
+        idx = torch.cat([idx, next_id], dim=1)
+
+print(tokenizer.decode(idx[0].tolist()))
+```
+
+---
+
+## Key Concepts
+
+| Term | One-liner |
+|---|---|
+| Tokenization | Text → integers via char→index dictionary |
+| BPE | Iteratively merge most frequent token pairs — discovers subword structure |
+| Embedding | Learnable lookup table — token ID → dense vector |
+| Positional embedding | Learned position vectors added to token embeddings |
+| Causal mask | Lower triangular — tokens can't attend to future positions |
+| Multi-head attention | N parallel attention heads, each learning different patterns |
+| Residual connection | `x = x + layer(x)` — preserves signal, enables depth |
+| LayerNorm | Normalize each token vector — stabilizes activations |
+| Cross-entropy loss | `-log(prob of correct token)` — the training signal |
+| AdamW | Adaptive per-weight LR + weight decay — standard LLM optimizer |
+| Gradient clipping | Cap gradient norm — prevents catastrophic updates |
+| LR warmup | Ramp from 0 → max LR — stable early training |
+| Cosine decay | Smooth LR reduction — precise late convergence |
+| Mixed precision | float16 forward + float32 backward — memory efficient |
+| Gradient scaling | Prevents float16 underflow during AMP training |
+| Validation loss | Held-out loss — confirms generalization not memorization |
+| Temperature | Divide logits by T — controls generation randomness |
+| Perplexity | `exp(val_loss)` — average equally-likely next tokens |
 
 ---
 
@@ -215,45 +277,38 @@ It is, my lord.
 
 ## How to Run
 
-**Install dependencies:**
 ```bash
+# Install
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 pip install matplotlib numpy
-```
 
-**Download data:**
-```bash
+# Data
 curl -o data/input.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-```
 
-**Run MLP experiment (Tanh vs GELU):**
-```bash
+# MLP experiment (Tanh vs GELU)
 python train.py
-```
 
-**Run transformer (6L-128D):**
-```bash
-python transformer/train.py
-```
-
-**Run transformer (8L-256D with AMP):**
-```bash
+# Transformer char tokenizer
 python transformer/train1.py
+
+# Train BPE tokenizer
+python char_lm/bpe_tokenizer.py
+
+# Transformer + BPE (best model)
+python transformer/train_bpe.py
 ```
 
 ---
 
 ## What I Learned
 
-Building this from scratch rather than using HuggingFace forced genuine understanding at every level:
-
-- Why attention solves what MLPs cannot — positional relationships between tokens
-- Why GELU outperforms Tanh at scale — gradient saturation is a real problem, not a textbook one
-- Why val loss and generation quality are not the same metric — MLP at loss 0.21 generated gibberish, transformer at 1.32 generated coherent dialogue
-- Why LR scheduling matters — same final loss in 3x less time
-- Why residual connections enable depth — without them gradients vanish through many layers
-- How mixed precision works mechanically — not just "it's faster" but why float16 needs gradient scaling
-
-Every component was debugged, measured, and compared against a baseline. The transformer at 6.4M params with block_size=128 generates text with correct archaic grammar, real Shakespeare character names, multi-speaker dialogue structure, and near-iambic rhythm — trained from raw character sequences with no linguistic knowledge built in.
+- Why attention beats MLPs — flat context destroys positional structure
+- Why GELU beats Tanh at scale — proved empirically with `&&&&` collapse
+- Why loss ≠ generation quality — MLP at 0.21 generated gibberish, transformer at 0.94 generated iambic pentameter
+- Why LR scheduling matters — same final quality in 3× less time
+- How BPE discovers language structure — pure frequency counting finds morphemes with zero linguistic knowledge
+- Why tokenizer choice matters as much as architecture — same model, char vs BPE: perplexity 2.56 → 1.30
+- How mixed precision works mechanically — float16 needs gradient scaling to not underflow
+- How to build a real training pipeline — val loss, checkpointing, grad clipping, AMP
 
 
